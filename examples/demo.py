@@ -3,14 +3,16 @@
 
 Usage::
 
-    python examples/demo.py [BASE_URL]
+    python examples/demo.py [BASE_URL] [--maintenance]
 
-Covers the three scenarios reviewers care about:
+Covers the scenarios reviewers care about:
 
 1. normal inference, then a successful hot swap;
 2. a failed candidate load (old version keeps serving);
 3. slow inference with a client timeout, followed by a swap and a third
    upload that is refused until the slow work finishes and the slot is freed.
+4. (``--maintenance``) a maintenance stop that waits for a 504'd inference,
+   reports safe only once both processes are gone, then resume + reload.
 """
 
 from __future__ import annotations
@@ -21,7 +23,9 @@ import time
 
 import httpx
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+BASE = ARGS[0] if ARGS else "http://127.0.0.1:8000"
+WITH_MAINTENANCE = "--maintenance" in sys.argv
 LABELS = ["pass", "scratch", "dent"]
 W1 = [[1.2, -0.4, 0.0, 0.3], [-0.2, 0.9, 0.5, -0.1], [0.1, -0.8, 1.1, 0.2]]
 W2 = [[0.3, 1.1, -0.2, 0.1], [1.3, -0.3, 0.1, -0.2], [-0.4, 0.2, 0.9, 0.7]]
@@ -102,7 +106,37 @@ def main() -> int:
         time.sleep(0.5)
     show("upload v4 now", client.post("/admin/models", json=artifact("v4", W2)))
     slots()
+
+    if WITH_MAINTENANCE:
+        maintenance_demo()
     return 0
+
+
+def maintenance_demo() -> None:
+    print("\n== 6. maintenance shutdown with a 504'd inference still computing ==")
+    show(
+        "slow infer, timeout_ms=100",
+        client.post(
+            "/infer", json={"features": FEATURES, "slow_ms": 2500, "timeout_ms": 100}
+        ),
+    )
+    show(
+        "stop with wait_seconds=15",
+        client.post("/admin/maintenance/stop", json={"wait_seconds": 15}),
+    )
+    show("infer during stop (expect 503)", client.post("/infer", json={"features": FEATURES}))
+    show(
+        "upload during stop (expect 503)",
+        client.post("/admin/models", json=artifact("v5", W1)),
+    )
+    slots()
+
+    print("\n== 7. resume: uploads reopen, inference stays 503 until a model loads ==")
+    show("resume", client.post("/admin/maintenance/resume"))
+    show("infer after resume (expect 503)", client.post("/infer", json={"features": FEATURES}))
+    show("upload v5", client.post("/admin/models", json=artifact("v5", W1)))
+    show("infer (v5)", client.post("/infer", json={"features": FEATURES}))
+    slots()
 
 
 if __name__ == "__main__":

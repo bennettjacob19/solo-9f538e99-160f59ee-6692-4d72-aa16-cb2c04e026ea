@@ -12,6 +12,12 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # Maintenance stop: how long an HTTP call waits by default, how long the
+      # stop waits for accepted work/swaps to settle before failing (never
+      # kills outstanding work), and how long each model process gets to exit.
+      DEFAULT_STOP_WAIT_SECONDS: "20"
+      MAINTENANCE_SETTLE_TIMEOUT_SECONDS: "300"
+      MAINTENANCE_STOP_TIMEOUT_SECONDS: "10"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1

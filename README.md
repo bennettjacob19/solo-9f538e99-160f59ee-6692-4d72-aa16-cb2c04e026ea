@@ -8,8 +8,11 @@ running a third model process.
 ```
 POST /infer           classify a feature vector (with optional client timeout)
 POST /admin/models    upload weights/bias/labels and hot-swap the model in
+POST /admin/maintenance/stop    refuse new work, drain, stop all model processes
+POST /admin/maintenance/resume  leave maintenance; reopen model uploads
+GET  /admin/maintenance/status  stop phase, unsettled work, safe_to_service
 GET  /admin/versions  version registry
-GET  /admin/status    active version, in-flight counts, per-process state
+GET  /admin/status    active version, in-flight counts, stop phase, process state
 GET  /healthz         liveness
 GET  /docs            Swagger UI (interactive; shows every field)
 ```
@@ -116,6 +119,63 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   is released and, if it was active, the service reports 503 (no active model)
   rather than routing to a dead process.
 
+## Maintenance shutdown
+
+A duty engineer who wants to free the machine for servicing calls:
+
+```
+POST /admin/maintenance/stop   {"reason": "work-order 4711", "wait_seconds": 20}
+```
+
+The stop is a small, strict state machine (`running -> draining -> stopped`,
+or `failed` from `draining`):
+
+* **Admission closes atomically.** `request_stop` flips the phase in the same
+  registry lock that inference admission and version-swap claims use. After
+  the call returns, `POST /infer` and `POST /admin/models` get **503
+  `service_stopping`**; there is no window where newly-arriving work is
+  admitted after the stop is acknowledged.
+* **Already-accepted work is never killed.** The coordinator waits for every
+  accepted inference whose in-flight counter is still raised — this includes a
+  request that already returned **504** to its client or whose client hung up,
+  because the counter only clears when the worker call actually returns — and
+  for any version swap that had already started, to commit or abort. Only then
+  does it stop processes. If settlement does not complete within
+  `MAINTENANCE_SETTLE_TIMEOUT_SECONDS`, the stop becomes `failed`, **processes
+  are left running**, and the machine is **not** reported safe.
+* **`safe_to_service` is proof-based.** After stopping, the coordinator reaps
+  each worker and verifies the OS process is gone (`Popen.poll()` / pid probe),
+  then frees the slot. Only if *that generation* recorded process-exit
+  verification, both slots are `idle`, and there is zero unsettled work (no
+  in-flight inference, no open swap claim) does the phase become `stopped` and
+  `safe_to_service` true. Any lingering live pid, occupied slot or unsettled
+  work produces a `failed` stop.
+* **A timed-out or disconnected stop request does not recover on its own.**
+  `wait_seconds` bounds only the HTTP wait; on expiry the call returns **504
+  `maintenance_still_draining`** with `safe_to_service: false` and
+  `stop_id`/`generation`, while the coordinator keeps running. The client
+  disconnecting behaves the same way. Nothing resumes automatically — only an
+  explicit `POST /admin/maintenance/resume` reopens admission.
+* **Resume reopens uploads, not inference.** After resume, `POST /admin/models`
+  works again and the version id may be reused, but `active_version` is `None`
+  so `/infer` keeps returning **503 `no_active_model`** until a freshly loaded
+  model is promoted.
+* **Stale waiters cannot certify.** Every stop attempt and every resume bumps
+  a `generation`. A waiter or a status poll carries the generation it started
+  with; once a later stop/resume has moved on, its outcome is `stale: true`
+  and `safe_to_service` is forced to false — an old waiter can never report
+  the machine serviceable after an interleaving.
+* **The two-process cap is unchanged.** A stop never spawns anything; it only
+  removes processes. `GET /admin/status` shows `maintenance.phase`,
+  `unsettled_inference`, `unsettled_swaps`, `slots_in_use`, and per-slot
+  state throughout.
+
+`GET /admin/maintenance/status?stop_id=...&generation=...` (or without
+parameters for the current generation) returns the same generation-scoped
+verdict for polling after a 504. `/healthz` stays 200 during a stop so an
+orchestrator does not restart the container and undo it; it reports
+`maintenance_phase` for observability.
+
 ## Demo scenarios
 
 1. **Normal swap.** Upload `examples/models/v1.json`, infer, upload `v2`,
@@ -129,8 +189,16 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Maintenance shutdown.** Start a 504'd slow inference, then
+   `POST /admin/maintenance/stop`. New `/infer` and uploads return 503; the
+   stop waits for the slow computation, stops both processes, and only then
+   returns `safe_to_service: true`. With a tiny `wait_seconds` you instead get
+   504 while the stop continues in the background; poll
+   `/admin/maintenance/status`. `POST /admin/maintenance/resume` reopens
+   uploads; inference stays 503 until a model is loaded again.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs the first three end to end; add
+`--maintenance` to include scenario 4.
 
 ## Observations from the smoke runs
 
@@ -151,9 +219,11 @@ app/
   worker_launcher.py  process entry point: load artifact, bind, serve, handshake
   models.py           artifact validation, NumPy scoring
 tests/
-  test_models.py          artifact validation + scoring
-  test_registry.py        state machine, claims, drain gate, crash reclaim
-  test_api_integration.py real API + real worker processes
+  test_models.py                  artifact validation + scoring
+  test_registry.py                state machine, claims, drain gate, crash reclaim
+  test_api_integration.py         real API + real worker processes
+  test_maintenance_integration.py maintenance stop/resume with real processes
+  test_maintenance_coordinator.py failed-stop / unsettled-work coordinator paths
 examples/
   demo.py, models/*.json
 ```
@@ -166,5 +236,8 @@ examples/
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
+| `DEFAULT_STOP_WAIT_SECONDS` | `20` | default `wait_seconds` for a maintenance stop request |
+| `MAINTENANCE_SETTLE_TIMEOUT_SECONDS` | `300` | max wait for accepted work/swaps to settle; expiry => failed stop |
+| `MAINTENANCE_STOP_TIMEOUT_SECONDS` | `10` | per-process exit wait during a stop |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |

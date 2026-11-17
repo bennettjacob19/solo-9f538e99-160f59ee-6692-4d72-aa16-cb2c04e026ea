@@ -35,16 +35,22 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
 from app.process_manager import (
+    MAINTENANCE_DRAINING,
+    MAINTENANCE_FAILED,
+    MAINTENANCE_STOPPED,
     STATE_DRAINING,
     STATE_IDLE,
     VERSION_ACTIVE,
     VERSION_FAILED,
     VERSION_LOADING,
     VERSION_RETIRED,
+    VERSION_STOPPED,
     FeatureMismatch,
+    MaintenanceConflict,
     NoActiveModel,
     NoCapacity,
     Registry,
+    ServiceStopping,
     SwapConflict,
     WorkerHandle,
 )
@@ -66,6 +72,19 @@ MAX_TIMEOUT_MS = 600_000
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# How long a maintenance stop waits for accepted inference and in-progress swaps
+# to settle before declaring the stop failed.  The stop never kills unsettled
+# work: on expiry it reports failure and leaves the processes alone.
+MAINTENANCE_SETTLE_TIMEOUT_SECONDS = float(
+    os.environ.get("MAINTENANCE_SETTLE_TIMEOUT_SECONDS", "300")
+)
+# How long each worker process gets to exit during a maintenance stop.
+MAINTENANCE_STOP_TIMEOUT_SECONDS = float(
+    os.environ.get("MAINTENANCE_STOP_TIMEOUT_SECONDS", "10")
+)
+MAINTENANCE_POLL_SECONDS = 0.05
+# How long POST /admin/maintenance/stop waits by default before returning 504.
+DEFAULT_STOP_WAIT_SECONDS = float(os.environ.get("DEFAULT_STOP_WAIT_SECONDS", "20"))
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +183,73 @@ class SlotView(BaseModel):
     alive: Optional[bool]
 
 
+class MaintenanceView(BaseModel):
+    phase: str
+    generation: int
+    stop_id: Optional[str] = None
+    reason: Optional[str]
+    error: Optional[str]
+    started_at: Optional[float]
+    stopped_at: Optional[float]
+    failed_at: Optional[float]
+    changed_at: Optional[float]
+    processes_verified: bool
+    admission_open: bool
+    unsettled_inference: int
+    unsettled_swaps: int
+    unsettled_total: int
+    slots_in_use: int
+    safe_to_service: bool
+
+
+class MaintenanceRequest(BaseModel):
+    reason: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Free-form note recorded with the stop (e.g. work order id)",
+    )
+    wait_seconds: float = Field(
+        DEFAULT_STOP_WAIT_SECONDS,
+        ge=0,
+        le=300,
+        description=(
+            "How long this HTTP call waits for the stop to settle. On expiry the "
+            "call returns 504 but the stop keeps running in the background; it is "
+            "never auto-resumed."
+        ),
+    )
+
+
+class MaintenanceStartResponse(BaseModel):
+    phase: str
+    generation: int
+    admission_open: bool
+    draining: bool
+    safe_to_service: bool
+    maintenance: MaintenanceView
+
+
+class MaintenanceWaitResponse(BaseModel):
+    """Outcome of waiting for a stop attempt, valid for one generation only."""
+
+    generation: int
+    phase: str
+    safe_to_service: bool
+    stale: bool
+    wait_seconds: float
+    maintenance: MaintenanceView
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MaintenanceResumeResponse(BaseModel):
+    phase: str
+    generation: int
+    admission_open: bool
+    active_version: Optional[str]
+    note: str
+    maintenance: MaintenanceView
+
+
 class StatusView(BaseModel):
     active_version: Optional[str]
     version: Optional[str]
@@ -174,6 +260,7 @@ class StatusView(BaseModel):
     capacity: int
     slots: List[SlotView]
     versions: List[Dict[str, Any]]
+    maintenance: MaintenanceView
 
 
 class SwapResult(BaseModel):
@@ -205,6 +292,16 @@ class InferenceService:
         self._background: set[asyncio.Task] = set()
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
+        # Maintenance stop coordination.  ``_stop_task`` outlives the HTTP
+        # request that started it: a client disconnect or timeout must not
+        # abort a stop halfway, nor do anything that could be mistaken for
+        # success.  ``_active_swaps`` counts swap claims held by this process so
+        # the stop can wait for a version replacement already under way.
+        self._stop_task: Optional[asyncio.Task] = None
+        self._stop_lock = asyncio.Lock()
+        # Serialises destructive worker-process operations (drain loop vs the
+        # maintenance coordinator) so a process is never stopped twice.
+        self._proc_lock = asyncio.Lock()
 
     # -- lifecycle -------------------------------------------------------
     async def startup(self) -> None:
@@ -256,6 +353,13 @@ class InferenceService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._drain_task
             self._drain_task = None
+        # A stop that is still running is abandoned, not "completed": process
+        # shutdown is not a maintenance certification.
+        if self._stop_task is not None:
+            self._stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stop_task
+            self._stop_task = None
         # Let accepted inference settle so no in-flight work is killed halfway
         # and no worker is left orphaned.  Bounded so shutdown cannot hang.
         if self._background:
@@ -397,7 +501,10 @@ class InferenceService:
         # Fail fast on a known-live version id before taking the swap claim, so
         # the common duplicate-upload case never disturbs the claim table.
         existing = self.registry.version_info(version)
-        if existing is not None and existing["state"] != VERSION_FAILED:
+        if existing is not None and existing["state"] not in (
+            VERSION_FAILED,
+            VERSION_STOPPED,
+        ):
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -411,6 +518,15 @@ class InferenceService:
         # first (which may be slow to load) and then failing anyway.
         try:
             old_version = self.registry.begin_swap(observed, token)
+        except ServiceStopping as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "service_stopping",
+                    "phase": exc.phase,
+                    "message": str(exc),
+                },
+            ) from exc
         except SwapConflict as exc:
             raise HTTPException(
                 status_code=409,
@@ -543,6 +659,231 @@ class InferenceService:
                         self.registry.fail_candidate(version, "swap aborted")
                 self.registry.end_swap(old_version, token)
 
+    # -- maintenance shutdown --------------------------------------------
+    async def request_stop(self, reason: Optional[str]) -> tuple[str, int]:
+        """Close admission and start (or join) a maintenance stop.
+
+        The coordinator task is deliberately detached from the HTTP request:
+        if the caller times out or disconnects while waiting, the stop keeps
+        running to a real conclusion and is never auto-resumed.  A second
+        request while the stop is draining joins the existing attempt rather
+        than bumping the generation (which would orphan the first waiter).
+        """
+        async with self._stop_lock:
+            current = self.registry.maintenance_view()
+            phase = current["phase"]
+            if phase in (MAINTENANCE_DRAINING, MAINTENANCE_STOPPED):
+                token = current["stop_id"]
+                generation = current["generation"]
+                if phase == MAINTENANCE_STOPPED:
+                    return token, generation
+                # Joining a draining attempt: make sure its coordinator lives.
+                if self._stop_task is None or self._stop_task.done():
+                    self._stop_task = asyncio.create_task(
+                        self._run_maintenance(token, generation, reason)
+                    )
+                return token, generation
+            token, generation = self.registry.begin_maintenance(reason)
+            if self._stop_task is not None and not self._stop_task.done():
+                # Defensive: begin_maintenance refuses while draining, so a
+                # live task should not coexist.  Cancel rather than orphan.
+                self._stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._stop_task
+            self._stop_task = asyncio.create_task(
+                self._run_maintenance(token, generation, reason)
+            )
+            return token, generation
+
+    async def wait_for_stop(
+        self, token: str, generation: int, wait_seconds: float
+    ) -> Dict[str, Any]:
+        """Wait for this stop generation to settle, bounded by ``wait_seconds``.
+
+        Returns the generation-scoped outcome.  A waiter that is still draining
+        when the wait expires receives ``stale``/``safe_to_service`` false; it
+        can poll again with the same ``stop_id`` and generation.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, wait_seconds)
+        while True:
+            view = self.registry.maintenance_outcome(token, generation)
+            if view["stale"] or view["phase"] in (
+                MAINTENANCE_STOPPED,
+                MAINTENANCE_FAILED,
+            ):
+                return view
+            if loop.time() >= deadline:
+                return view
+            await asyncio.sleep(MAINTENANCE_POLL_SECONDS)
+
+    async def _run_maintenance(
+        self, token: str, generation: int, reason: Optional[str]
+    ) -> None:
+        logger.info("maintenance stop generation=%d started (reason=%r)", generation, reason)
+        loop = asyncio.get_running_loop()
+        try:
+            settled = await self._await_settled(token, generation, loop)
+            if not settled:
+                return  # failed / stale; registry already records why
+            stopped = await self._stop_all_processes(token, generation)
+            if not stopped:
+                return
+            self.registry.mark_processes_verified(token, generation)
+            if self.registry.finish_maintenance(token, generation):
+                view = self.registry.maintenance_view()
+                logger.info(
+                    "maintenance stop generation=%d complete: slots_in_use=%d safe=%s",
+                    generation,
+                    view["slots_in_use"],
+                    view["safe_to_service"],
+                )
+            else:
+                view = self.registry.maintenance_view()
+                logger.error(
+                    "maintenance stop generation=%d could not certify idle "
+                    "(slots_in_use=%d unsettled=%d)",
+                    generation,
+                    view["slots_in_use"],
+                    view["unsettled_total"],
+                )
+                self.registry.fail_maintenance(
+                    token,
+                    generation,
+                    "processes exited but the machine is not provably idle "
+                    f"(slots_in_use={view['slots_in_use']}, "
+                    f"unsettled={view['unsettled_total']})",
+                )
+        except asyncio.CancelledError:
+            logger.warning("maintenance stop generation=%d was cancelled", generation)
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("maintenance stop generation=%d crashed", generation)
+            self.registry.fail_maintenance(
+                token, generation, f"stop coordinator error: {exc}"
+            )
+
+    async def _await_settled(
+        self, token: str, generation: int, loop: asyncio.AbstractEventLoop
+    ) -> bool:
+        """Wait for accepted inference and in-flight swaps to actually settle.
+
+        Nothing is killed while work is outstanding: a 504'd or disconnected
+        request keeps its in-flight counter until the worker call returns, and
+        an already-started swap keeps its registry claim until it commits or
+        aborts.  On timeout the stop is marked failed and processes are left
+        untouched.
+        """
+        deadline = loop.time() + max(0.0, MAINTENANCE_SETTLE_TIMEOUT_SECONDS)
+        while True:
+            view = self.registry.maintenance_outcome(token, generation)
+            if view["stale"] or view["phase"] != MAINTENANCE_DRAINING:
+                return False
+            if view["unsettled_inference"] == 0 and view["unsettled_swaps"] == 0:
+                return True
+            if loop.time() >= deadline:
+                self.registry.fail_maintenance(
+                    token,
+                    generation,
+                    "timed out waiting for outstanding work to settle "
+                    f"(inference={view['unsettled_inference']}, "
+                    f"swaps={view['unsettled_swaps']})",
+                )
+                logger.error(
+                    "maintenance stop generation=%d timed out with unsettled work; "
+                    "processes were left running and the machine is NOT serviceable",
+                    generation,
+                )
+                return False
+            await asyncio.sleep(MAINTENANCE_POLL_SECONDS)
+
+    async def _stop_all_processes(self, token: str, generation: int) -> bool:
+        """Stop every worker process, verify exit, then release every slot.
+
+        Runs under ``_proc_lock`` so the drain loop cannot concurrently stop or
+        release the same process.  Any process that cannot be proven exited
+        turns the stop into a failure -- being alive is never reported safe.
+        """
+        async with self._proc_lock:
+            if self.registry.maintenance_view()["generation"] != generation:
+                return False
+            for version, handle in list(self.handles.items()):
+                try:
+                    await asyncio.to_thread(
+                        handle.stop, MAINTENANCE_STOP_TIMEOUT_SECONDS
+                    )
+                    await asyncio.to_thread(
+                        handle.wait_exit, MAINTENANCE_STOP_TIMEOUT_SECONDS
+                    )
+                except Exception:
+                    logger.exception("failed to stop worker for %s", version)
+                if not handle.exited():
+                    self.registry.fail_maintenance(
+                        token,
+                        generation,
+                        f"worker process for {version} is still alive after stop",
+                    )
+                    logger.error(
+                        "maintenance stop generation=%d failed: %s still alive",
+                        generation,
+                        version,
+                    )
+                    return False
+                info = self.registry.version_info(version) or {}
+                slot_id = info.get("slot_id")
+                if slot_id:
+                    self.registry.release_after_stop(
+                        slot_id, version, process_exited=True
+                    )
+                self.handles.pop(version, None)
+
+            # Slots whose handle is already gone (a crashed worker the drain
+            # loop reaped) still need their bookkeeping freed -- but only when
+            # the recorded pid is provably gone.
+            for slot in self.registry.snapshot()["slots"]:
+                version = slot["version"]
+                if version is None:
+                    continue
+                if self._pid_alive(slot["pid"]):
+                    self.registry.fail_maintenance(
+                        token,
+                        generation,
+                        f"slot {slot['slot_id']} still has live pid {slot['pid']}",
+                    )
+                    return False
+                self.registry.release_after_stop(
+                    slot["slot_id"], version, process_exited=True
+                )
+                self.handles.pop(version, None)
+
+            view = self.registry.maintenance_view()
+            if view["slots_in_use"] != 0:
+                self.registry.fail_maintenance(
+                    token,
+                    generation,
+                    f"{view['slots_in_use']} slot(s) still occupied after stopping",
+                )
+                return False
+            return True
+
+    @staticmethod
+    def _pid_alive(pid: Optional[int]) -> bool:
+        if not pid or pid < 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def start_resume(self) -> Dict[str, Any]:
+        """Reopen admission.  Workers stay down and inference stays 503."""
+        generation = self.registry.resume_maintenance()
+        logger.info("maintenance resumed at generation=%d", generation)
+        return self.registry.maintenance_view()
+
     # -- draining --------------------------------------------------------
     async def _drain_loop(self) -> None:
         while True:
@@ -555,6 +896,10 @@ class InferenceService:
                 logger.exception("drain loop error")
 
     async def drain_once(self) -> None:
+        async with self._proc_lock:
+            await self._drain_once_locked()
+
+    async def _drain_once_locked(self) -> None:
         snapshot = self.registry.snapshot()
         for version, info in snapshot["versions"].items():
             handle = self.handles.get(version)
@@ -614,6 +959,15 @@ class InferenceService:
     ) -> InferResponse:
         try:
             version, _slot_id = self.registry.accept_work(len(features))
+        except ServiceStopping as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "service_stopping",
+                    "phase": exc.phase,
+                    "message": str(exc),
+                },
+            ) from exc
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -754,7 +1108,11 @@ class InferenceService:
             versions=sorted(
                 snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
             ),
+            maintenance=MaintenanceView(**snapshot["maintenance"]),
         )
+
+    def maintenance(self) -> MaintenanceView:
+        return MaintenanceView(**self.registry.maintenance_view())
 
 
 def _new_manager() -> Any:
@@ -811,7 +1169,13 @@ app = FastAPI(
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
-        "upload -> 429 until the slow work finishes and the slot is released."
+        "upload -> 429 until the slow work finishes and the slot is released.\n"
+        "- Maintenance: `POST /admin/maintenance/stop` with `wait_seconds` refuses "
+        "new inference/uploads, waits for already-accepted work (including 504'd "
+        "requests) and any started swap to settle, stops both model processes, and "
+        "returns `safe_to_service` only after every process is confirmed gone and "
+        "both slots are idle. `POST /admin/maintenance/resume` reopens uploads; "
+        "inference stays 503 until a new model is loaded."
     ),
     lifespan=lifespan,
 )
@@ -819,8 +1183,12 @@ app = FastAPI(
 
 @app.get("/healthz", tags=["ops"], summary="Liveness probe")
 def healthz() -> Dict[str, Any]:
+    # Deliberately always 200 while the process is alive: a maintenance stop
+    # must not look like a failed container, or an orchestrator would restart
+    # it and undo the stop.  The phase is exposed for observability only.
     active = service.registry.active_version()
-    return {"ok": True, "active_version": active}
+    phase = service.registry.maintenance_phase()
+    return {"ok": True, "active_version": active, "maintenance_phase": phase}
 
 
 @app.post(
@@ -861,6 +1229,17 @@ async def infer(req: InferRequest) -> InferResponse:
     summary="Upload a classifier and hot-swap it in",
 )
 async def upload_model(payload: ModelUpload) -> SwapResult:
+    try:
+        service.registry.require_admission("model upload")
+    except ServiceStopping as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "service_stopping",
+                "phase": exc.phase,
+                "message": str(exc),
+            },
+        ) from exc
     if not VERSION_RE.match(payload.version):
         raise HTTPException(
             status_code=422,
@@ -918,7 +1297,151 @@ def versions() -> Dict[str, Any]:
     "/admin/status",
     response_model=StatusView,
     tags=["admin"],
-    summary="Active version, in-flight counts and process states",
+    summary="Active version, in-flight counts, process states and stop phase",
 )
 def status() -> StatusView:
     return service.status()
+
+
+@app.post(
+    "/admin/maintenance/stop",
+    response_model=MaintenanceWaitResponse,
+    tags=["maintenance"],
+    responses={
+        409: {"description": "A stop is already draining or the service is stopped"},
+        504: {
+            "description": (
+                "The stop was accepted but did not settle within wait_seconds. "
+                "It keeps running; poll status with the returned stop_id. No "
+                "process was killed and the machine is not reported safe."
+            )
+        },
+    },
+    summary="Refuse new work, drain accepted work, stop all model processes",
+)
+async def maintenance_stop(
+    payload: Optional[MaintenanceRequest] = None,
+) -> MaintenanceWaitResponse:
+    reason = payload.reason if payload is not None else None
+    wait_seconds = (
+        payload.wait_seconds if payload is not None else DEFAULT_STOP_WAIT_SECONDS
+    )
+    try:
+        token, generation = await service.request_stop(reason)
+    except MaintenanceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "maintenance_conflict", "message": str(exc)},
+        ) from exc
+    started = time.perf_counter()
+    view = await service.wait_for_stop(token, generation, wait_seconds)
+    elapsed = time.perf_counter() - started
+    if view["stale"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "maintenance_stale",
+                "message": (
+                    "this stop generation was superseded; its outcome no longer "
+                    "describes the machine"
+                ),
+                "stop_id": token,
+                "generation": generation,
+                "phase": view["phase"],
+                "safe_to_service": False,
+            },
+        )
+    if view["phase"] == MAINTENANCE_DRAINING:
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "maintenance_still_draining",
+                "stop_id": token,
+                "generation": generation,
+                "phase": view["phase"],
+                "safe_to_service": False,
+                "unsettled_inference": view["unsettled_inference"],
+                "unsettled_swaps": view["unsettled_swaps"],
+                "slots_in_use": view["slots_in_use"],
+                "waited_seconds": round(elapsed, 3),
+                "note": (
+                    "The stop continues in the background and is not auto-resumed. "
+                    "Poll GET /admin/status; never treat a timeout as safe."
+                ),
+            },
+        )
+    if view["phase"] == MAINTENANCE_FAILED or not view["safe_to_service"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "maintenance_failed",
+                "stop_id": token,
+                "generation": generation,
+                "phase": view["phase"],
+                "safe_to_service": False,
+                "error_detail": view["error"],
+                "slots_in_use": view["slots_in_use"],
+                "unsettled_inference": view["unsettled_inference"],
+                "unsettled_swaps": view["unsettled_swaps"],
+                "note": "Do not service the machine; inspect status and logs.",
+            },
+        )
+    return MaintenanceWaitResponse(
+        generation=generation,
+        phase=view["phase"],
+        safe_to_service=True,
+        stale=False,
+        wait_seconds=round(elapsed, 3),
+        maintenance=MaintenanceView(**view),
+    )
+
+
+@app.get(
+    "/admin/maintenance/status",
+    response_model=MaintenanceWaitResponse,
+    tags=["maintenance"],
+    summary="Stop phase, unsettled work, slot occupancy; safe only for this generation",
+)
+def maintenance_status(
+    stop_id: Optional[str] = None, generation: Optional[int] = None
+) -> MaintenanceWaitResponse:
+    current = service.registry.maintenance_view()
+    token = stop_id if stop_id is not None else current["stop_id"]
+    gen = generation if generation is not None else current["generation"]
+    view = service.registry.maintenance_outcome(token, gen)
+    return MaintenanceWaitResponse(
+        generation=gen,
+        phase=view["phase"],
+        safe_to_service=bool(view["safe_to_service"]),
+        stale=bool(view["stale"]),
+        wait_seconds=0.0,
+        maintenance=MaintenanceView(**view),
+    )
+
+
+@app.post(
+    "/admin/maintenance/resume",
+    response_model=MaintenanceResumeResponse,
+    tags=["maintenance"],
+    responses={409: {"description": "Not stopped/failed, or still draining"}},
+    summary="Leave maintenance: reopen uploads; inference stays 503 until a model loads",
+)
+def maintenance_resume() -> MaintenanceResumeResponse:
+    try:
+        view = service.start_resume()
+    except MaintenanceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "maintenance_conflict", "message": str(exc)},
+        ) from exc
+    return MaintenanceResumeResponse(
+        phase=view["phase"],
+        generation=view["generation"],
+        admission_open=view["admission_open"],
+        active_version=service.registry.active_version(),
+        note=(
+            "Model uploads are accepted again. Inference keeps returning 503 "
+            "until a newly uploaded model has loaded and been promoted."
+        ),
+        maintenance=MaintenanceView(**view),
+    )

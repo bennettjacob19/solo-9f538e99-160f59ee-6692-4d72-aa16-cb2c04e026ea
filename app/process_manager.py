@@ -30,6 +30,11 @@ Rules encoded here:
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
   (enforced by a data-directory lock), so this one writer owns the budget.
+* A maintenance stop flips ``maintenance_phase`` out of ``running`` in the
+  same lock as ``accept_work``/``begin_swap``, so admission closes exactly
+  once.  ``safe_to_service`` is only ever true for the current generation,
+  after the coordinator has verified every worker process exited, both slots
+  are idle, and no in-flight inference or open swap claim remains.
 """
 
 from __future__ import annotations
@@ -55,12 +60,33 @@ VERSION_LOADING = "loading"
 VERSION_ACTIVE = "active"
 VERSION_RETIRED = "retired"
 VERSION_FAILED = "failed"
+VERSION_STOPPED = "stopped"
+
+# Maintenance-shutdown phases.  ``running`` is the only phase that admits new
+# inference and new model uploads.
+MAINTENANCE_RUNNING = "running"
+MAINTENANCE_DRAINING = "draining"
+MAINTENANCE_STOPPED = "stopped"
+MAINTENANCE_FAILED = "failed"
 
 CLAIM_NONE = "__none__"
 
 
 class NoCapacity(RuntimeError):
     """Both process slots are occupied (loading/active/draining)."""
+
+
+class ServiceStopping(RuntimeError):
+    """Maintenance shutdown has begun; new work must not be admitted."""
+
+    def __init__(self, message: str, phase: str, generation: int) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.generation = generation
+
+
+class MaintenanceConflict(RuntimeError):
+    """The requested maintenance transition is invalid for the current phase."""
 
 
 class SwapConflict(RuntimeError):
@@ -89,8 +115,27 @@ class Registry:
         self._versions = manager.dict()
         self._slots = manager.dict()
         self._claims = manager.dict()
-        self._state = manager.dict({"active_version": None})
         now = time.time()
+        self._state = manager.dict(
+            {
+                "active_version": None,
+                # Maintenance shutdown state.  ``generation`` is bumped by every
+                # stop attempt and every resume; a waiter may only report
+                # "stopped" for the exact generation it started with, so a
+                # stale waiter can never call the machine serviceable after a
+                # later stop/resume interleaving.
+                "maintenance_phase": MAINTENANCE_RUNNING,
+                "maintenance_generation": 0,
+                "maintenance_token": None,
+                "maintenance_verified": False,
+                "maintenance_reason": None,
+                "maintenance_error": None,
+                "maintenance_started_at": None,
+                "maintenance_stopped_at": None,
+                "maintenance_failed_at": None,
+                "maintenance_changed_at": now,
+            }
+        )
         for i in range(SLOT_COUNT):
             slot_id = f"slot-{i}"
             self._slots[slot_id] = {
@@ -122,7 +167,73 @@ class Registry:
                 "slots": [slots[k] for k in sorted(slots)],
                 "versions": versions,
                 "claims": dict(self._claims),
+                "maintenance": self._maintenance_view_locked(),
             }
+
+    def _maintenance_view_locked(self) -> Dict[str, Any]:
+        """Maintenance view computed under the registry lock.
+
+        ``safe_to_service`` is deliberately strict: it requires the coordinator
+        to have verified process exit (``processes_verified``) *for the current
+        generation*, the stop phase to be fully reached, both slots idle, and
+        zero unsettled work.  Callers may only report "safe" from this view.
+        """
+        unsettled_inference = sum(
+            int(s["in_flight"]) for s in self._slots.values()
+        )
+        unsettled_swaps = len(self._claims)
+        slots_in_use = sum(
+            1 for s in self._slots.values() if s["process_state"] != STATE_IDLE
+        )
+        phase = self._state["maintenance_phase"]
+        verified = bool(self._state["maintenance_verified"])
+        return {
+            "phase": phase,
+            "generation": int(self._state["maintenance_generation"]),
+            "stop_id": self._state["maintenance_token"],
+            "reason": self._state["maintenance_reason"],
+            "error": self._state["maintenance_error"],
+            "started_at": self._state["maintenance_started_at"],
+            "stopped_at": self._state["maintenance_stopped_at"],
+            "failed_at": self._state["maintenance_failed_at"],
+            "changed_at": self._state["maintenance_changed_at"],
+            "processes_verified": verified,
+            "admission_open": phase == MAINTENANCE_RUNNING,
+            "unsettled_inference": unsettled_inference,
+            "unsettled_swaps": unsettled_swaps,
+            "unsettled_total": unsettled_inference + unsettled_swaps,
+            "slots_in_use": slots_in_use,
+            "safe_to_service": (
+                phase == MAINTENANCE_STOPPED
+                and verified
+                and slots_in_use == 0
+                and unsettled_inference == 0
+                and unsettled_swaps == 0
+            ),
+        }
+
+    def maintenance_view(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._maintenance_view_locked()
+
+    def maintenance_phase(self) -> str:
+        with self._lock:
+            return str(self._state["maintenance_phase"])
+
+    def require_admission(self, action: str) -> None:
+        """Reject new work once maintenance shutdown has been requested."""
+        with self._lock:
+            self._require_admission_locked(action)
+
+    def _require_admission_locked(self, action: str) -> None:
+        phase = self._state["maintenance_phase"]
+        if phase != MAINTENANCE_RUNNING:
+            generation = int(self._state["maintenance_generation"])
+            raise ServiceStopping(
+                f"maintenance shutdown is {phase}; {action} is not admitted",
+                phase=phase,
+                generation=generation,
+            )
 
     def active_version(self) -> Optional[str]:
         with self._lock:
@@ -150,6 +261,202 @@ class Registry:
             )
 
     # ------------------------------------------------------------------
+    # Maintenance shutdown
+    # ------------------------------------------------------------------
+    def begin_maintenance(self, reason: Optional[str]) -> Tuple[str, int]:
+        """Close admission and enter the draining phase.
+
+        Atomic with ``accept_work`` / ``begin_swap``: whichever side takes the
+        registry lock first wins, so there is no window in which a request is
+        admitted after the stop has been acknowledged.  A ``failed`` stop may
+        be retried; a stop that is already ``draining`` or ``stopped`` may not
+        be started again until it has been resumed.
+        """
+        with self._lock:
+            phase = self._state["maintenance_phase"]
+            if phase == MAINTENANCE_DRAINING:
+                raise MaintenanceConflict("a maintenance shutdown is already draining")
+            if phase == MAINTENANCE_STOPPED:
+                raise MaintenanceConflict(
+                    "the service is already stopped for maintenance; resume first"
+                )
+            generation = int(self._state["maintenance_generation"]) + 1
+            token = uuid.uuid4().hex
+            now = time.time()
+            self._state["maintenance_generation"] = generation
+            self._state["maintenance_phase"] = MAINTENANCE_DRAINING
+            self._state["maintenance_token"] = token
+            self._state["maintenance_verified"] = False
+            self._state["maintenance_reason"] = reason
+            self._state["maintenance_error"] = None
+            self._state["maintenance_started_at"] = now
+            self._state["maintenance_stopped_at"] = None
+            self._state["maintenance_failed_at"] = None
+            self._state["maintenance_changed_at"] = now
+            return token, generation
+
+    def mark_processes_verified(self, token: str, generation: int) -> bool:
+        """Record that every worker process for this stop was proven exited."""
+        with self._lock:
+            if not self._maintenance_token_matches_locked(token, generation):
+                return False
+            if self._state["maintenance_phase"] != MAINTENANCE_DRAINING:
+                return False
+            self._state["maintenance_verified"] = True
+            self._state["maintenance_changed_at"] = time.time()
+            return True
+
+    def finish_maintenance(self, token: str, generation: int) -> bool:
+        """Promote draining -> stopped, but only when the machine is provably idle.
+
+        Requires the coordinator's process-exit verification, zero slots in
+        use, zero in-flight inference and zero open swap claims.  On a stale
+        token/generation it changes nothing and returns False.
+        """
+        with self._lock:
+            if not self._maintenance_token_matches_locked(token, generation):
+                return False
+            if self._state["maintenance_phase"] != MAINTENANCE_DRAINING:
+                return False
+            view = self._maintenance_view_locked()
+            if (
+                not view["processes_verified"]
+                or view["slots_in_use"] != 0
+                or view["unsettled_inference"] != 0
+                or view["unsettled_swaps"] != 0
+            ):
+                return False
+            now = time.time()
+            self._state["maintenance_phase"] = MAINTENANCE_STOPPED
+            self._state["maintenance_stopped_at"] = now
+            self._state["maintenance_changed_at"] = now
+            return True
+
+    def fail_maintenance(self, token: str, generation: int, error: str) -> bool:
+        """Record a failed stop.  Never reports the machine as serviceable."""
+        with self._lock:
+            if not self._maintenance_token_matches_locked(token, generation):
+                return False
+            if self._state["maintenance_phase"] != MAINTENANCE_DRAINING:
+                return False
+            now = time.time()
+            self._state["maintenance_phase"] = MAINTENANCE_FAILED
+            self._state["maintenance_error"] = error
+            self._state["maintenance_verified"] = False
+            self._state["maintenance_failed_at"] = now
+            self._state["maintenance_changed_at"] = now
+            return True
+
+    def resume_maintenance(self) -> int:
+        """Reopen admission.  Only valid from ``stopped`` or ``failed``.
+
+        Bumps the generation so any waiter from an earlier stop can detect that
+        its outcome is stale and must not report the machine as serviceable.
+
+        The active version is always cleared, so inference keeps returning 503
+        until a new upload is promoted.  If a *failed* stop left a worker
+        process alive, its version is moved to ``retired``/``draining`` so the
+        drain loop stops it once any accepted work genuinely finishes -- resume
+        never kills unsettled inference and never resumes serving on a process
+        the stop was trying to remove.
+        """
+        with self._lock:
+            phase = self._state["maintenance_phase"]
+            if phase == MAINTENANCE_RUNNING:
+                raise MaintenanceConflict("the service is not in maintenance")
+            if phase == MAINTENANCE_DRAINING:
+                raise MaintenanceConflict(
+                    "a maintenance shutdown is still draining; wait for it to settle"
+                )
+            now = time.time()
+            active = self._state["active_version"]
+            if active is not None:
+                info = self._versions.get(active)
+                if info is not None:
+                    info = dict(info)
+                    info.update(
+                        state=VERSION_RETIRED,
+                        process_state=STATE_DRAINING,
+                        retired_at=now,
+                    )
+                    self._versions[active] = info
+                    slot = self._slots.get(info["slot_id"])
+                    if slot is not None and slot["version"] == active:
+                        slot = dict(slot)
+                        slot["process_state"] = STATE_DRAINING
+                        self._slots[info["slot_id"]] = slot
+            self._state["active_version"] = None
+            generation = int(self._state["maintenance_generation"]) + 1
+            self._state["maintenance_generation"] = generation
+            self._state["maintenance_phase"] = MAINTENANCE_RUNNING
+            self._state["maintenance_token"] = None
+            self._state["maintenance_verified"] = False
+            self._state["maintenance_changed_at"] = now
+            return generation
+
+    def maintenance_outcome(self, token: str, generation: int) -> Dict[str, Any]:
+        """Return the outcome *as seen for the caller's generation*.
+
+        ``stale`` is true whenever the generation moved on (a resume or a new
+        stop), in which case ``safe_to_service`` is forced to false: a waiter
+        that began before an interleaving may never certify the machine.
+        """
+        with self._lock:
+            current = int(self._state["maintenance_generation"])
+            view = self._maintenance_view_locked()
+            stale = generation != current or self._state["maintenance_token"] != token
+            view["stale"] = stale
+            view["waiter_generation"] = generation
+            if stale:
+                view["safe_to_service"] = False
+            return view
+
+    def release_after_stop(
+        self, slot_id: str, version: str, process_exited: bool
+    ) -> bool:
+        """Free a slot during maintenance once its OS process is proven gone.
+
+        Unlike ``release_slot`` this accepts an ``active`` or ``failed`` slot;
+        it still refuses while any accepted work is counted in flight, so a
+        slot can never look free while its process is still computing.
+        """
+        if not process_exited:
+            return False
+        with self._lock:
+            slot = self._slots.get(slot_id)
+            if slot is None or slot["version"] != version:
+                return False
+            if slot["in_flight"] != 0:
+                return False
+            info = self._versions.get(version)
+            now = time.time()
+            slot = dict(slot)
+            slot.update(
+                version=None,
+                process_state=STATE_IDLE,
+                pid=None,
+                in_flight=0,
+                idle_since=now,
+            )
+            self._slots[slot_id] = slot
+            if info is not None and info.get("slot_id") == slot_id:
+                info = dict(info)
+                if info["state"] != VERSION_FAILED:
+                    info["state"] = VERSION_STOPPED
+                info["process_state"] = STATE_IDLE
+                info["stopped_at"] = now
+                self._versions[version] = info
+            if self._state["active_version"] == version:
+                self._state["active_version"] = None
+            return True
+
+    def _maintenance_token_matches_locked(self, token: str, generation: int) -> bool:
+        return (
+            int(self._state["maintenance_generation"]) == generation
+            and self._state["maintenance_token"] == token
+        )
+
+    # ------------------------------------------------------------------
     # Admission / registration
     # ------------------------------------------------------------------
     def begin_swap(
@@ -168,6 +475,7 @@ class Registry:
         proceed.
         """
         with self._lock:
+            self._require_admission_locked("model replacement")
             active = self._state["active_version"]
             if enforce_expected and expected_version != active:
                 raise SwapConflict(
@@ -191,17 +499,17 @@ class Registry:
     def reserve_any_slot(self, version: str) -> str:
         """Atomically pick an idle slot and register a loading candidate.
 
-        A version id whose previous attempt *failed* may be retried; the new
-        attempt keeps the earlier error for auditing.  Any other existing
-        version id is rejected, so a live or historical version can never be
-        overwritten.
+        A version id whose previous attempt *failed* or was *stopped* for
+        maintenance may be uploaded again after resume; the new attempt keeps
+        the earlier error for auditing.  Any live version id is rejected, so a
+        serving or draining version can never be overwritten.
         """
         with self._lock:
             previous = self._versions.get(version)
             attempt = 1
             previous_error = None
             if previous is not None:
-                if previous["state"] != VERSION_FAILED:
+                if previous["state"] not in (VERSION_FAILED, VERSION_STOPPED):
                     raise SwapConflict(
                         f"version {version!r} already exists ({previous['state']})"
                     )
@@ -366,6 +674,7 @@ class Registry:
         request never touches the in-flight counter.
         """
         with self._lock:
+            self._require_admission_locked("inference")
             version = self._state["active_version"]
             if version is None:
                 raise NoActiveModel("no model is active")
@@ -588,6 +897,25 @@ class WorkerHandle:
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def exited(self) -> bool:
+        """True only once the OS process is provably gone.
+
+        With a ``Popen`` handle this means the child has been reaped (no
+        zombie left); for a handle without a ``Popen`` it falls back to a
+        signal-0 liveness probe on the recorded pid.
+        """
+        if self._proc is not None:
+            return self._proc.poll() is not None
+        if self.pid is None:
+            return True
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
 
     def wait_exit(self, timeout: float) -> bool:
         if self._proc is None:
